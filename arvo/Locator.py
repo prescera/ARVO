@@ -868,6 +868,59 @@ def reproduce(localId, dockerize = True, update = True):
         patch_url, verified, fuzz_target, fuzz_engine,
         sanitizer, crash_type, crash_output, severity, res['report'],fix_commit, language, repo_addr, submodule_bug))
 
+def locate_record(localId, image_prefix):
+    """
+    Patch-locating pass for an issue that is already reproduced, with its vul/fix images in
+    `image_prefix` (e.g. <region>-docker.pkg.dev/<project>/arvo/arvo). Same fields as reproduce(),
+    but returns a dict (one arvo.db row) instead of writing the local database, so records from
+    many workers can be merged with build_db().
+    """
+    localId = localIdMapping(localId)
+    rec = {"localId": localId, "patch_located": False}
+    res = report(localId, True)          # bisect between the vul and fix srcmaps
+    if res:
+        fix_commit = res['fix_commit']
+        if isinstance(fix_commit, list):
+            fix_commit = "\n".join(fix_commit)
+        rec.update(patch_located=True, patch_url=res['fix'], verified=res['verify'],
+                   fuzz_engine=res['fuzzer'], sanitizer=res['sanitizer'], crash_type=res['crash_type'],
+                   severity=res.get('severity', "UNK"), report=res['report'], fix_commit=fix_commit,
+                   repo_addr=res['repo_addr'], submodule_bug=res['submodule_bug'])
+    else:
+        _, issue = getIssueTuple(localId)
+        rec.update(fuzz_engine=issue['job_type'].split("_")[0], sanitizer=issue['job_type'].split("_")[1],
+                   crash_type=issue['crash_type'], severity=issue.get('severity', "UNK"),
+                   report=f"https://issues.oss-fuzz.com/issues/{localId}")
+    rec.update(project=getPname(localId), language=getLanguage(localId), reproduced=True,
+               reproducer_vul=f"docker run --rm -it {image_prefix}:{localId}-vul arvo",
+               reproducer_fix=f"docker run --rm -it {image_prefix}:{localId}-fix arvo")
+    # Fuzz target and crash output from the published images (no -it: workers have no TTY)
+    vul, fix = f"{image_prefix}:{localId}-vul", f"{image_prefix}:{localId}-fix"
+    r = subprocess.run(["docker", "run", "--rm", fix, "grep", "-oP", "-m1", r"/out/\K\S+", "/bin/arvo"],
+                       capture_output=True, text=True)
+    rec['fuzz_target'] = r.stdout.strip() if r.returncode == 0 else "FAILED_TO_GET"
+    try:
+        r = subprocess.run(["docker", "run", "--rm", vul, "arvo"], capture_output=True, timeout=600)
+        rec['crash_output'] = (r.stdout + r.stderr).decode("utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        rec['crash_output'] = "TIMEOUT"
+    docker_rmi(vul); docker_rmi(fix)
+    buildClean(localId)
+    return rec
+DB_COLUMNS = ["localId", "project", "reproduced", "reproducer_vul", "reproducer_fix", "patch_located",
+    "patch_url", "verified", "fuzz_target", "fuzz_engine", "sanitizer", "crash_type", "crash_output",
+    "severity", "report", "fix_commit", "language", "repo_addr", "submodule_bug"]
+def build_db(record_files):
+    # Insert locate_record() outputs into the local arvo.db (replacing existing rows for those ids)
+    n = 0
+    for f in record_files:
+        rec = json.load(open(f))
+        if arvoRecorded(rec['localId']) and not delete_entry(rec['localId']):
+            continue
+        if insert_entry(tuple(rec.get(c) for c in DB_COLUMNS)):
+            n += 1
+    return n
+
 if __name__ == '__main__':
     if len(sys.argv) == 2:
         report(int(sys.argv[1]),debug=True)

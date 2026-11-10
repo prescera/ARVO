@@ -72,6 +72,16 @@ def cli_show(localId):
         print(json.dumps(res,indent=4))
 def cli_summary():
     pass
+def cli_locate(localId, image_prefix, out):
+    from .Locator import locate_record
+    rec = locate_record(localId, image_prefix)
+    Path(out).write_text(json.dumps(rec, indent=2))
+    print(f"[+] {localId}: patch_located={rec['patch_located']} -> {out}")
+def cli_build_db(record_dir):
+    from .Locator import build_db
+    files = sorted(Path(record_dir).glob("*.json"))
+    n = build_db(files)
+    print(f"[+] Inserted {n}/{len(files)} records into {ARVO / 'arvo.db'}")
 def cli_collect(since, until):
     from datetime import date
     from .utils_meta import getMeta, metaFilter
@@ -110,6 +120,16 @@ def main():
     p_collect.add_argument("--since", required=True, help="YYYY-MM-DD (inclusive)")
     p_collect.add_argument("--until", default=None, help="YYYY-MM-DD (exclusive, default: end of this year)")
 
+    # locate (second pass over reproduced issues: fix commit + crash output -> one arvo.db record)
+    p_locate = subparsers.add_parser("locate", help="Locate the fix commit of a reproduced issue; write an arvo.db record as JSON")
+    p_locate.add_argument("localId", type=int)
+    p_locate.add_argument("--image-prefix", required=True, help="Registry path holding <id>-vul/<id>-fix images")
+    p_locate.add_argument("--out", required=True, help="Output JSON file")
+
+    # build-db
+    p_build_db = subparsers.add_parser("build-db", help="Insert `arvo locate` JSON records from a directory into arvo.db")
+    p_build_db.add_argument("record_dir", type=str)
+
     args = parser.parse_args()
 
     if args.command == "reproduce":
@@ -126,6 +146,10 @@ def main():
         cli_summary()
     elif args.command == 'collect':
         cli_collect(args.since, args.until)
+    elif args.command == 'locate':
+        cli_locate(args.localId, args.image_prefix, args.out)
+    elif args.command == 'build-db':
+        cli_build_db(args.record_dir)
 
 if __name__ == "__main__":
     main()

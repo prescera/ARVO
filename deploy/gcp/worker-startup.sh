@@ -79,12 +79,19 @@ run_one() {
         "$id" "$status" "$reason" "$IMAGE_PREFIX" "$HOST" "$start" "$(date -u +%FT%TZ)" > "$out/result.json"
     gcloud storage cp "$out/result.json" "gs://$BUCKET/results/$id.json" >/dev/null
     rm -rf "$out"
-    # Remove this issue's own containers and images. ARVO only cleans up on a normal exit, so
-    # timeouts and failures otherwise leak tens of GB. Safe during other builds: nothing else
-    # references these names (unlike `docker image prune`, which races in-flight layers).
+    cleanup_issue "$id"
+    echo "[arvo] $id -> $status"
+}
+
+# Remove one issue's own containers and images, release the shared Docker lock, prune if needed.
+# ARVO only cleans up on a normal exit, so timeouts and failures otherwise leak tens of GB.
+# Safe during other builds: nothing else references these names (unlike `docker image prune`,
+# which races in-flight layers).
+cleanup_issue() {
+    local id=$1
     docker ps -aq --filter "name=^reproducer_${id}$" --filter "name=^arvo_rf_${id}_(vul|fix)$" | xargs -r docker rm -f >/dev/null 2>&1
     docker ps -aq --filter "ancestor=gcr.io/oss-fuzz/$id" | xargs -r docker rm -f >/dev/null 2>&1
-    docker rmi -f "gcr.io/oss-fuzz/$id" "n132/arvo:$id-vul" "n132/arvo:$id-fix" >/dev/null 2>&1
+    docker rmi -f "gcr.io/oss-fuzz/$id" "n132/arvo:$id-vul" "n132/arvo:$id-fix" "$IMAGE_PREFIX:$id-vul" "$IMAGE_PREFIX:$id-fix" >/dev/null 2>&1
     rm -f /data/docker-push-queue/"$id"-*.tar
     exec 9>&-   # release the shared Docker lock
     # Base images (one ~3 GB digest per bug date) accumulate; the disk is sized so this rarely
@@ -92,14 +99,50 @@ run_one() {
     if [ "$(df --output=pcent /var/lib | tail -1 | tr -dc 0-9)" -gt 85 ]; then
         flock -x /run/arvo-gate.lock flock -x /run/arvo-docker.lock docker image prune -af >/dev/null 2>&1
     fi
-    echo "[arvo] $id -> $status"
 }
-export -f run_one
+
+# Second pass (arvo-mode=locate): for a reproduced issue, bisect to the fix commit and capture
+# fuzz target + crash output from the published images -> gs://$BUCKET/patches/<id>.json, an
+# arvo.db record (`arvo build-db` merges them). Failures go to patches_failed/ so reruns skip them.
+locate_one() {
+    local id=$1 out=/data/results/$1 status=failed
+    gcloud storage ls "gs://$BUCKET/patches/$id.json" "gs://$BUCKET/patches_failed/$id.json" >/dev/null 2>&1 && return 0
+    mkdir -p "$out"
+    local start=$(date -u +%FT%TZ)
+    flock /run/arvo-gate.lock true
+    exec 9>/run/arvo-docker.lock; flock -s 9
+    ( cd /data && timeout "$ISSUE_TIMEOUT" /src/arvo_venv/bin/arvo locate "$id" --image-prefix "$IMAGE_PREFIX" --out "$out/record.json" ) > "$out/locate.log" 2>&1
+    local rc=$?
+    cp -r /src/ARVO/arvo/Log/bisect/"$id" "$out/bisect" 2>/dev/null
+    grep -hF "$id" /src/ARVO/arvo/_CrashLOGs /src/ARVO/arvo/Log/_Event.log > "$out/diagnostics.txt" 2>/dev/null
+    gcloud storage cp -r "$out" "gs://$BUCKET/logs-locate/" >/dev/null 2>&1
+    if [ $rc -eq 0 ] && [ -s "$out/record.json" ]; then
+        status=$(python3 -c "import json,sys; print('located' if json.load(open(sys.argv[1]))['patch_located'] else 'not_located')" "$out/record.json")
+        python3 - "$out/record.json" "$start" "$HOST" <<'PY'
+import json, sys, datetime
+p, start, host = sys.argv[1:]
+r = json.load(open(p)); r["_started"] = start; r["_finished"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"); r["_worker"] = host
+json.dump(r, open(p, "w"))
+PY
+        gcloud storage cp "$out/record.json" "gs://$BUCKET/patches/$id.json" >/dev/null
+    else
+        [ $rc -eq 124 ] && status=timeout
+        printf '{"localId": %s, "status": "%s", "rc": %s, "worker": "%s", "_started": "%s", "_finished": "%s"}\n' \
+            "$id" "$status" "$rc" "$HOST" "$start" "$(date -u +%FT%TZ)" > "$out/failed.json"
+        gcloud storage cp "$out/failed.json" "gs://$BUCKET/patches_failed/$id.json" >/dev/null
+    fi
+    rm -rf "$out"
+    cleanup_issue "$id"
+    echo "[arvo] locate $id -> $status"
+}
+export -f run_one locate_one cleanup_issue
 export BUCKET IMAGE_PREFIX ISSUE_TIMEOUT HOST
 
+MODE=$(md arvo-mode || true); MODE=${MODE:-reproduce}
+FN=run_one; [ "$MODE" = locate ] && FN=locate_one
 gcloud storage cat "gs://$BUCKET/input/$IDS_OBJ" | awk -v s="$SHARD" -v n="$SHARDS" 'NF && (NR-1)%n==s' |
-    xargs -P "$JOBS" -I{} bash -c 'run_one {}'
+    xargs -P "$JOBS" -I{} bash -c "$FN {}"
 
-echo done | gcloud storage cp - "gs://$BUCKET/workers/$HOST.done"
+echo done | gcloud storage cp - "gs://$BUCKET/workers/$HOST.$MODE.done"
 echo "[arvo] $HOST finished shard $SHARD"
 poweroff
