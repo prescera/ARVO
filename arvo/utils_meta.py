@@ -19,7 +19,7 @@ def metaFilter():
     false_positives = []
     for localId in localIds:
         target_dir = Path(DATADIR)/"Issues"/(str(localId)+"_files")
-        if len(list(target_dir.iterdir())) <2:
+        if not target_dir.exists() or len(list(target_dir.iterdir())) <2:
             res.append(localId)
             WARN(f"[!] Have less than 2 srcmaps, deleting issue {localId}...")
             continue
@@ -54,11 +54,21 @@ def metaFilter():
     res = list(set(res))
     remove_issue_meta(res)
     remove_issue_data(res)
-def getIssueIds():
+def _month_windows(since, until):
+    # Yield [start, end) date pairs, one per calendar month, covering [since, until)
+    cur = since.replace(day=1)
+    while cur < until:
+        nxt = cur.replace(year=cur.year + 1, month=1) if cur.month == 12 else cur.replace(month=cur.month + 1)
+        yield max(cur, since), min(nxt, until)
+        cur = nxt
+def getIssueIds(since=None, until=None):
+    # since/until: datetime.date; defaults cover the whole tracker history (2016 -> now)
+    since = since or datetime(2016, 1, 1).date()
+    until = until or (datetime.now().date().replace(month=12, day=31))
     localIds = []
     session = requests.Session()
     # Step 1: Get the token from the cookie
-    session.get("https://issues.oss-fuzz.com/")
+    session.get("https://issues.oss-fuzz.com/", timeout=60)
     xsrf_token = session.cookies.get("XSRF_TOKEN")
     # Step 2: Use it in the header
     headers = {
@@ -68,16 +78,14 @@ def getIssueIds():
         'X-XSRF-Token': xsrf_token
     }
     url = 'https://issues.oss-fuzz.com/action/issues/list'
-    start_index = 0
-    start_year  = 2016
-    next_year   = datetime.now().year + 1
-    while start_year != next_year:
+    # Query month by month: the tracker caps a single query at 2,500 results
+    for start, end in _month_windows(since, until):
         init_num = len(localIds)
         start_index = 0
         while True:
-            end_year = start_year +1
-            data = [None, None, None, None, None, ["391"], [f"type:vulnerability status:verified created<{end_year}-01-01 created>{start_year}-01-01", None, 500, f"start_index:{start_index}"]]
-            response = session.post(url, headers=headers, json=data)
+            query = f"type:vulnerability status:verified created>={start.isoformat()} created<{end.isoformat()}"
+            data = [None, None, None, None, None, ["391"], [query, None, 500, f"start_index:{start_index}"]]
+            response = session.post(url, headers=headers, json=data, timeout=120)
             data = response.text
             # Fix malformed JSON-like string
             clean_data = re.sub(r'\bnull\b', 'null', data)
@@ -85,20 +93,18 @@ def getIssueIds():
             clean_data = re.sub(r',\s*]', ']', clean_data)
             # Parse with regex (quick and dirty)
             issues = re.findall(r'\[\s*null\s*,\s*(\d+),\s*\[\d+,\d+,\d+,\d+,\d+,"(.*?)"', clean_data)
-            
+
             for issue_id, title in issues:
                 localIds.append(issue_id)
             if len(issues)!=500:
                 break
             start_index+=500
             if (len(localIds) - init_num == 2500):
-                WARN("Out of Limit. Not Supported yet. (You may split it by month instead of year)")
-                exit(1)
+                PANIC(f"Query limit (2,500) hit for {start}..{end}; results would be truncated")
         added_num = len(localIds) - init_num
-        SUCCESS(f"[+] Added {added_num:,} issues from {start_year} ({len(localIds):,} total)")
-        start_year+=1
-    
-    return [int(x) for x in localIds]
+        SUCCESS(f"[+] Added {added_num:,} issues from {start}..{end} ({len(localIds):,} total)")
+
+    return list(dict.fromkeys(int(x) for x in localIds))
 
 def parse_oss_fuzz_report(report_text: bytes,localId: int) -> dict:
     text = report_text.decode('unicode_escape', errors='ignore')  # decode escaped unicode like \u003d
@@ -106,8 +112,7 @@ def parse_oss_fuzz_report(report_text: bytes,localId: int) -> dict:
         m = re.search(pattern, text)
         if not m:
             if default=='':
-                WARN(f"FAILED to PARSE {pattern} {localId=}")
-                exit(1)
+                raise ValueError(f"FAILED to PARSE {pattern} {localId=}")
             else:
                 return default
         return m.group(1).strip()
@@ -132,11 +137,12 @@ def parse_oss_fuzz_report(report_text: bytes,localId: int) -> dict:
         "ubsan": "undefined",
     }
     fuzz_target = extract(r'(?:Fuzz Target|Fuzz target|Fuzz target binary|Fuzzer):\s*(\S+)','NOTFOUND')
-    if len(res['job_type'].split("_"))==2:
+    job_parts = res['job_type'].split("_")
+    if len(job_parts)==2 or job_parts[1] not in sanitizer_map:
         WARN(f"FAILED to GET sanitizer {localId=} {res['job_type']}")
         return False
     else:
-        res['sanitizer'] = sanitizer_map[res['job_type'].split("_")[1]]
+        res['sanitizer'] = sanitizer_map[job_parts[1]]
 
     if fuzz_target != 'NOTFOUND':
         res['fuzz_target'] = fuzz_target
@@ -144,11 +150,17 @@ def parse_oss_fuzz_report(report_text: bytes,localId: int) -> dict:
         res['project'] = res['job_type'].split("_")[-1]
     return res
 def meta_getIssue(issue_id):
-    url = f'https://issues.oss-fuzz.com/action/issues/{issue_id}/events?currentTrackerId=391'
+    # The tracker no longer serves /action/issues/{id}/events. The report text (job type,
+    # crash, regressed range, testcase) is in the issue itself, and the
+    # "verified as fixed in <range>" comment comes from POST .../updates.
+    base = f'https://issues.oss-fuzz.com/action/issues/{issue_id}'
     session = requests.Session()
-    # Step 1: Get the token from the cookie
-    session.get("https://issues.oss-fuzz.com/")
-    xsrf_token = session.cookies.get("XSRF_TOKEN")
+    # Step 1: Get the token from the cookie (currently unset by the tracker; reads work without it)
+    try:
+        session.get("https://issues.oss-fuzz.com/", timeout=60)
+    except requests.RequestException:
+        pass
+    xsrf_token = session.cookies.get("XSRF_TOKEN") or ''
     headers = {
         'accept': 'application/json, text/plain, */*',
         'accept-language': 'en,zh-CN;q=0.9,zh;q=0.8,ar;q=0.7',
@@ -163,15 +175,20 @@ def meta_getIssue(issue_id):
         'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
         'X-XSRF-Token': xsrf_token
     }
-    response = session.get(url, headers=headers)
-    raw_text = response.content
     try:
-        res = parse_oss_fuzz_report(raw_text,issue_id)
-    except:
-        WARN(f"FAIL on {issue_id}, skip")
+        issue = session.get(base, headers=headers, timeout=60)
+        updates = session.post(f'{base}/updates?currentTrackerId=391', json=[issue_id],
+            headers={**headers, 'content-type': 'application/json', 'origin': 'https://issues.oss-fuzz.com'}, timeout=60)
+        if issue.status_code != 200 or updates.status_code != 200:
+            WARN(f"FAIL on {issue_id} (HTTP {issue.status_code}/{updates.status_code}), skip")
+            return False
+        res = parse_oss_fuzz_report(issue.content + b"\n" + updates.content, issue_id)
+    except Exception as e:
+        WARN(f"FAIL on {issue_id}: {e}, skip")
         return False
     return res
-def meta_getIssues(issue_ids):
+def meta_getIssues(issue_ids, workers=16):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     issues = []
     if not MetaDataFile.exists():
         MetaDataFile.touch()
@@ -182,14 +199,17 @@ def meta_getIssues(issue_ids):
         done.append(json.loads(line)['localId'])
     todo = [x for x in issue_ids if x not in done]
     INFO(f"Added {len(todo)} new issues")
-    for x in bar(todo):
-        res = meta_getIssue(x)
-        if res:
-            issues.append(res)
-            with open(MetaDataFile,'a') as f:
-                f.write(json.dumps(res) + '\n') 
-        else:
-            WARN(f"Failed to fetch the issue for {x}")
+    # Fetch in parallel; only this thread appends to MetaDataFile
+    with ThreadPoolExecutor(workers) as pool, open(MetaDataFile,'a') as f:
+        futures = {pool.submit(meta_getIssue, x): x for x in todo}
+        for fut in bar(as_completed(futures)):
+            res = fut.result()
+            if res:
+                issues.append(res)
+                f.write(json.dumps(res) + '\n')
+                f.flush()
+            else:
+                WARN(f"Failed to fetch the issue for {futures[fut]}")
     return todo
 # Parse the job type into parts
 def parse_job_type(job_type):
@@ -221,7 +241,11 @@ storage_client = None
 def download_build_artifacts(metadata, url, outdir):
     global storage_client
     if storage_client is None:
-        storage_client = storage.Client()
+        # clusterfuzz-builds* buckets are public; fall back to anonymous access without a key
+        try:
+            storage_client = storage.Client()
+        except Exception:
+            storage_client = storage.Client.create_anonymous_client()
     bucket_map = {
         "libfuzzer_address_i386": "clusterfuzz-builds-i386",
         "libfuzzer_memory_i386": "clusterfuzz-builds-i386",
@@ -303,51 +327,72 @@ def download_build_artifacts(metadata, url, outdir):
         print(f'Downloaded {name}')
         downloaded_files.append(download_path)
     return [str(f) for f in downloaded_files]
+def _projectLanguage(pname):
+    # getLanguage() needs the srcmaps, which are not downloaded yet at this stage,
+    # so resolve the language from the project name (PLanguage.json, then project.yaml).
+    if pname in PLanguage: return PLanguage[pname]
+    url = f"https://raw.githubusercontent.com/google/oss-fuzz/master/projects/{pname}/project.yaml"
+    try:
+        r = requests.get(url, timeout=30)
+        m = re.search(r'^language\s*:\s*"?([^\s"]+)', r.text, re.M) if r.status_code == 200 else None
+    except requests.RequestException:
+        m = None
+    PLanguage[pname] = m.group(1) if m else None
+    return PLanguage[pname]
 def data_download(localIds = None):
     metadata = {}
     for line in open(MetaDataFile):
         line = json.loads(line)
         if localIds == None or line['localId'] in localIds:
             metadata[line['localId']] = line
-    to_remove = []
-    for localId in bar(metadata):
-        # Get reproducer(s) and save them.
+    def _one(localId):
+        # Returns True if the issue should be removed from the dataset
         issue_dir = META / "Issues" / f"{localId}_files"
         if issue_dir.exists():
             done = []
             for x in issue_dir.iterdir():
                 done.append(x)
             if len(done) == 2:
-                continue
+                return False
             elif len(done) != 0:
                 shutil.rmtree(issue_dir)
         issue_dir.mkdir(parents=True, exist_ok=True)
         if 'regressed' not in metadata[localId] or 'verified_fixed' not in metadata[localId] or \
             metadata[localId]['verified_fixed'] == 'NO_FIX':
-            continue
-        if getLanguage(str(localId)) not in ['c','c++']:
+            return False
+        if _projectLanguage(metadata[localId]['project']) not in ['c','c++']:
             WARN(f"[!] Not C/C++ Issue: {localId=}")
-            to_remove.append(x)
-            continue
-        if not silentRun(download_build_artifacts,metadata[localId], metadata[localId]['regressed'], issue_dir): 
-            WARN(f"[!] Failed to download the srcmap: {localId=}")
-            to_remove.append(localId)
-            continue
-        if not silentRun(download_build_artifacts,metadata[localId], metadata[localId]['verified_fixed'], issue_dir):
-            WARN(f"[!] Failed to download the srcmap: {localId=}")
-            to_remove.append(localId)
-            continue
-
+            return True
+        # Not silentRun(): it swaps the global sys.stdout, which is unsafe across threads
+        for rng in ('regressed', 'verified_fixed'):
+            try:
+                ok = download_build_artifacts(metadata[localId], metadata[localId][rng], issue_dir)
+            except Exception as e:
+                ok = False
+            if not ok:
+                WARN(f"[!] Failed to download the srcmap: {localId=}")
+                return True
+        return False
+    from concurrent.futures import ThreadPoolExecutor
+    global storage_client
+    if storage_client is None:   # initialise once, before the threads race on it
+        try:
+            storage_client = storage.Client()
+        except Exception:
+            storage_client = storage.Client.create_anonymous_client()
+    with ThreadPoolExecutor(16) as pool:
+        ids = list(metadata)
+        to_remove = [i for i, rm in zip(ids, bar(pool.map(_one, ids))) if rm]
 
     remove_issue_meta(to_remove)
     remove_issue_data(to_remove)
     return True
-def getMeta():
+def getMeta(since=None, until=None):
     if not NEW_ISSUE_TRACKER: PANIC("THIS SCRIPT ONLY WORKS FOR NEW_ISSUE_TRACKER")
-    if not META.exists(): META.mkdir()
-    todo = meta_getIssues(getIssueIds())
+    if not META.exists(): META.mkdir(parents=True)
+    todo = meta_getIssues(getIssueIds(since, until))
     print(todo)
-    data_download(todo)
+    data_download()  # all issues: resumes srcmap downloads from interrupted runs; finished ones are skipped
 
 if __name__ == "__main__":
     pass

@@ -582,10 +582,21 @@ def clone(url,commit=None,dest=None,name=None,main_repo=False,commit_date=None):
             return False
         if name == None:
             name = list(dest.iterdir())[0]
-        return DB_INSERT(url,dest/name)
+        DB_INSERT(url,dest/name)  # caching is best-effort; the clone itself succeeded
+        return True
     def _check_out(commit,path):
         with open('/dev/null','w') as f:
-            return check_call(['git',"reset",'--hard', commit], cwd=path, stdout=f,stderr=f)
+            if not check_call(['git',"reset",'--hard', commit], cwd=path, stdout=f,stderr=f):
+                return False
+        # `reset --hard` leaves submodules missing (plain clone) or at another revision
+        # (cached copy), so bring them to the commits recorded at this revision. Best-effort.
+        if (path / ".gitmodules").exists():
+            try:
+                subprocess.run("git submodule sync --recursive && git submodule update --init --recursive --force",
+                    shell=True, cwd=path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1800)
+            except subprocess.TimeoutExpired:
+                WARN(f"[!] Submodule update timed out in {path}")
+        return True
     if(dest):
         dest = Path(dest)
     else:
@@ -626,7 +637,8 @@ def svn_clone(url,commit=None,dest=None,rename=None):
             return False
         if name == None:
             name = list(dest.iterdir())[0]
-        return DB_INSERT(url,dest/name)
+        DB_INSERT(url,dest/name)  # caching is best-effort; the clone itself succeeded
+        return True
     if(dest):
         tmp = Path(dest)
     else:
@@ -651,7 +663,8 @@ def hg_clone(url,commit=None,dest=None,rename=None):
             return False
         if name == None:
             name = list(dest.iterdir())[0]
-        return DB_INSERT(url,dest/name)
+        DB_INSERT(url,dest/name)  # caching is best-effort; the clone itself succeeded
+        return True
     if(dest):
         tmp = Path(dest)
     else:
@@ -680,9 +693,11 @@ def dbCOPY(url,dest,name):
             if name == None:
                 name = db_repo.name
             try:
-                shutil.copytree(original_dir,dest/name,symlinks=True)
+                with repo_lock(url):  # don't copy while another worker replaces the cache entry
+                    shutil.copytree(original_dir,dest/name,symlinks=True)
                 return True
             except:
+                shutil.rmtree(dest/name, ignore_errors=True)
                 return False
         else:
             DB_remove(url,db_repo)

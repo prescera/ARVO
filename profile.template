@@ -13,6 +13,14 @@ TIME_ZONE           = 'Etc/Greenwich'
 
 UserName            = 'root'
 
+# Ablation switches used by the reproducer (keep False for normal runs)
+EVAL_NOSRCMAP       = False
+EVAL_NOREBASE       = False
+EVAL_NOURLFIX       = False
+EVAL_NOCOMPONENT    = False
+# Remove per-issue /out and /work build dirs when an issue finishes
+CLEAN_OUT_BUILD     = True
+
 
 # Config
 ARVO_DIR            = f'/src/ARVO/arvo' # Path of ARVO

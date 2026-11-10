@@ -7,8 +7,9 @@ from .utils import *
 from .Locator import report
 from .utils_log import *
 
-def cli_reproduce(localId):
-    res = verify(localId, False)
+def cli_reproduce(localId, save_img=False):
+    # save_img: commit vul/fix images and `docker save` them into DOCKER_PUSH_QUEUE
+    res = verify(localId, save_img)
     if res:
         out = OSS_IMG / f"{localId}"
         print(f"[+] Successfully reproduced {localId=}, see: {out}")
@@ -71,6 +72,11 @@ def cli_show(localId):
         print(json.dumps(res,indent=4))
 def cli_summary():
     pass
+def cli_collect(since, until):
+    from datetime import date
+    from .utils_meta import getMeta, metaFilter
+    getMeta(date.fromisoformat(since), date.fromisoformat(until) if until else None)
+    metaFilter()
 def main():
     parser = argparse.ArgumentParser(prog="arvo", description="ARVO CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -78,6 +84,7 @@ def main():
     # reproduce
     p_reproduce = subparsers.add_parser("reproduce", help="Reproduce a bug")
     p_reproduce.add_argument("localId", type=int)
+    p_reproduce.add_argument("--save-img", action="store_true", help="Save vul/fix images to DOCKER_PUSH_QUEUE")
 
     # report
     p_report = subparsers.add_parser("report", help="Generate a report")
@@ -98,10 +105,15 @@ def main():
     # summary
     p_summary = subparsers.add_parser("summary", help="Print the summary of current reproducing process")
 
+    # collect
+    p_collect = subparsers.add_parser("collect", help="Fetch metadata and srcmaps for OSS-Fuzz issues created in [since, until)")
+    p_collect.add_argument("--since", required=True, help="YYYY-MM-DD (inclusive)")
+    p_collect.add_argument("--until", default=None, help="YYYY-MM-DD (exclusive, default: end of this year)")
+
     args = parser.parse_args()
 
     if args.command == "reproduce":
-        cli_reproduce(args.localId)
+        cli_reproduce(args.localId, args.save_img)
     elif args.command == "report":
         cli_report(args.localId)
     elif args.command == "list":
@@ -112,6 +124,8 @@ def main():
         cli_show(args.localId)
     elif args.command == 'summary':
         cli_summary()
+    elif args.command == 'collect':
+        cli_collect(args.since, args.until)
 
 if __name__ == "__main__":
     main()

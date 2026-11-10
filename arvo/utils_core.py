@@ -1,5 +1,6 @@
 from .utils import *
 from dateutil.parser import parse
+from datetime import timezone
 from bisect import bisect_right
 import time
 from . import _profile
@@ -99,7 +100,7 @@ def fixDockerfile(dockerfile_path,project,commit_date):
         # Both replacements
         dft.appendLine('''RUN sed -i \
         -e '/^[[:space:]]*make[[:space:]]\\{1,\\}fate-rsync[[:space:]]\\{1,\\}SAMPLES=\\$TEST_SAMPLES_PATH[[:space:]]*$/c\\echo ARVO' \
-        -e '/fate-suite/c\\echo ARVO' \
+        -e '/^[[:space:]]*\\(rm\\|zip\\|make\\)[[:space:]].*fate-suite\\($\\|.*[^\\\\]$\\)/c\\echo ARVO' \
         /src/build.sh && \
         (grep -nE 'echo ARVO|fate-rsync|fate-suite' /src/build.sh || echo "[info] no matching lines; nothing replaced")''')
 
@@ -138,27 +139,77 @@ def fixDockerfile(dockerfile_path,project,commit_date):
     dft.cleanComments()
     assert(dft.flush()==True)
     return True
+# Before this point every base-builder image is the default (non-24.04) variant
+MULTI_UBUNTU_TS = int(datetime(2025, 9, 1, tzinfo=timezone.utc).timestamp())
 def rebaseDockerfile(dockerfile_path,commit_date):
     if _profile.EVAL_NOREBASE:
         return True
-    def _getBase(date,repo="gcr.io/oss-fuzz-base/base-builder"):
+    def _listTags(repo):
+        # Anonymous Docker Registry v2 listing; same shape as `gcloud container images list-tags --format=json`
+        host, path = repo.split("/", 1)
+        manifests = requests.get(f"https://{host}/v2/{path}/tags/list", timeout=120).json()["manifest"]
+        res = [{"digest": d, "tags": m.get("tag", []),
+                "timestamp": {"datetime": datetime.fromtimestamp(int(m["timeUploadedMs"]) / 1000, timezone.utc).isoformat()}}
+               for d, m in manifests.items()]
+        return sorted(res, key=lambda x: parse(x['timestamp']['datetime']))
+    def _ubuntuVersion(repo, digest, cache):
+        # Read org.opencontainers.image.version (e.g. "24.04") from the image config
+        if digest in cache: return cache[digest]
+        host, path = repo.split("/", 1)
+        accept = {"Accept": ",".join(["application/vnd.docker.distribution.manifest.v2+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+            "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json"])}
+        for attempt in range(3):
+            try:
+                m = requests.get(f"https://{host}/v2/{path}/manifests/{digest}", headers=accept, timeout=60).json()
+                if "manifests" in m:
+                    child = [x for x in m["manifests"] if x.get("platform", {}).get("architecture") == "amd64"][0]["digest"]
+                    m = requests.get(f"https://{host}/v2/{path}/manifests/{child}", headers=accept, timeout=60).json()
+                cfg = requests.get(f"https://{host}/v2/{path}/blobs/{m['config']['digest']}", timeout=60).json()
+                if cfg.get("architecture") != "amd64":
+                    cache[digest] = None
+                else:
+                    cache[digest] = (cfg.get("config", {}).get("Labels") or {}).get("org.opencontainers.image.version")
+                return cache[digest]
+            except Exception:
+                time.sleep(2 ** attempt)
+        # Network failure: don't cache, so a later run can classify this digest
+        raise RuntimeError(f"rebaseDockerfile: cannot read image config of {repo}@{digest}")
+    def _getBase(date,repo="gcr.io/oss-fuzz-base/base-builder",variant=None):
         cache_name = repo.split("/")[-1]
         CACHE_FILE = f"/tmp/{cache_name}_cache.json"
+        VARIANT_FILE = f"/tmp/{cache_name}_variants.json"
         CACHE_TTL = 86400  # 24 hours
+        target_ts = int(parse(date).timestamp())
+        res = None
         if os.path.exists(CACHE_FILE) and (time.time() - os.path.getmtime(CACHE_FILE)) < CACHE_TTL:
             with open(CACHE_FILE, 'r') as f: res = json.load(f)
-        else:
-            cmd = [
-                "gcloud", "container", "images", "list-tags",
-                repo, "--format=json", "--sort-by=timestamp"
-            ]
-            res = execute(cmd).decode()
-            res = json.loads(res)
+            # A cache that ends before the target date would silently pin a stale image
+            if not res or int(parse(res[-1]['timestamp']['datetime']).timestamp()) < target_ts: res = None
+        if res is None:
+            res = _listTags(repo)
             with open(CACHE_FILE, 'w') as f: f.write(json.dumps(res,indent=4))
         ts = []
         for x in res: ts.append(int(parse(x['timestamp']['datetime']).timestamp()))
-        target_ts = int(parse(date).timestamp())
-        return res[bisect_right(ts, target_ts - 1) - 1]['digest'].split(":")[1]
+        idx = bisect_right(ts, target_ts - 1) - 1
+        # Since Sept 2025 the repo interleaves ubuntu-20-04 (default) and ubuntu-24-04 images,
+        # so walk back to the newest digest of the variant the Dockerfile asked for.
+        variant = variant or "20.04"
+        variants = json.load(open(VARIANT_FILE)) if os.path.exists(VARIANT_FILE) else {}
+        try:
+            for i in range(idx, -1, -1):
+                if ts[i] < MULTI_UBUNTU_TS:
+                    if variant == "20.04": return res[i]['digest'].split(":")[1]
+                    break
+                if _ubuntuVersion(repo, res[i]['digest'], variants) == variant:
+                    return res[i]['digest'].split(":")[1]
+            # No image of this variant before the date: use the oldest one after it
+            for i in range(max(idx, 0), len(res)):
+                if ts[i] >= MULTI_UBUNTU_TS and _ubuntuVersion(repo, res[i]['digest'], variants) == variant:
+                    return res[i]['digest'].split(":")[1]
+            return False
+        finally:
+            with open(VARIANT_FILE, 'w') as f: json.dump(variants, f)
     # Load the Dockerfile
     try:
         with open(dockerfile_path) as f: data = f.read()
@@ -173,9 +224,21 @@ def rebaseDockerfile(dockerfile_path,commit_date):
     else: repo = res[0][5:]
     if "@sha256" in repo: repo = repo.split("@sha256")[0]
     if repo == 'ossfuzz/base-builder' or repo == 'ossfuzz/base-libfuzzer': repo = "gcr.io/oss-fuzz-base/base-builder"
-    if ":" in repo: repo = repo.split(":")[0]
-    image_hash = _getBase(commit_date,repo)
-    data = re.sub(r"FROM .*",f"FROM {repo}@sha256:"+image_hash+"\nRUN apt-get update -y\n",data)
+    variant = None
+    if ":" in repo:
+        repo, tag = repo.split(":", 1)
+        m = re.match(r'ubuntu-(\d+)-(\d+)$', tag.strip())
+        if m: variant = f"{m.group(1)}.{m.group(2)}"
+    try:
+        image_hash = _getBase(commit_date,repo,variant)
+    except Exception as e:
+        eventLog(f"[-] rebaseDockerfile: {e}")
+        return False
+    if not image_hash:
+        eventLog(f"[-] rebaseDockerfile: No {repo} image for ubuntu {variant} near {commit_date}")
+        return False
+    # apt retries: a short archive.ubuntu.com outage otherwise fails the whole image build
+    data = re.sub(r"FROM .*",f"FROM {repo}@sha256:"+image_hash+"\nRUN echo 'Acquire::Retries \"8\";' > /etc/apt/apt.conf.d/80-arvo-retries && apt-get update -y\n",data)
     with open(dockerfile_path,'w') as f: f.write(data)
     return True
 def extraScritps(pname,oss_dir,source_dir):

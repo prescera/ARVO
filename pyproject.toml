@@ -16,6 +16,7 @@ dependencies = [
     "filelock",
     "setuptools",
     "rich",
+    "requests",
     "configparser"
 ]
 

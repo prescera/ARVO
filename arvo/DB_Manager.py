@@ -1,6 +1,7 @@
 from pathlib import Path
 from ._profile import *
 import json
+import os
 import shutil
 from time import sleep
 from base58 import b58encode
@@ -31,6 +32,26 @@ def updateCrashLog(result: str, log_file: str, perm: str = 'a') -> bool:
     except Exception as e:
         FAIL(f"Failed to update crash log {log_file}: {e}")
         return False
+def _write_map(rec: Dict[str, str]) -> None:
+    # Atomic replace, so concurrent readers never see a half-written map
+    tmp = OSS_DB_MAP.with_name(f"map.{os.getpid()}.tmp")
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(rec, f, indent=4, ensure_ascii=False)
+    os.replace(tmp, OSS_DB_MAP)
+def _update_map(fn) -> bool:
+    # Read-modify-write the map under the map lock, so concurrent processes don't lose updates
+    with FileLock(OSS_DB_LOCK):
+        try:
+            with open(OSS_DB_MAP, 'r', encoding='utf-8') as f:
+                rec = json.load(f)
+        except FileNotFoundError:
+            rec = {}
+        fn(rec)
+        _write_map(rec)
+    return True
+def repo_lock(url: str) -> FileLock:
+    # One lock per cached repo: held while the cache copy is written, replaced or copied out
+    return FileLock(OSS_DB / f"{b58encode(url.encode()).decode()}.lock")
 def DB_DUMP(rec: Dict[str, str]) -> bool:
     """Dump database record to JSON file with retry mechanism."""
     if not isinstance(rec, dict):
@@ -42,8 +63,7 @@ def DB_DUMP(rec: Dict[str, str]) -> bool:
         try:
             lock = FileLock(OSS_DB_LOCK)
             with lock:
-                with open(OSS_DB_MAP, 'w', encoding='utf-8') as f:
-                    json.dump(rec, f, indent=4, ensure_ascii=False)
+                _write_map(rec)
             return True
         except Exception as e:
             WARN(f"DB_DUMP attempt {ct + 1} failed: {e}")
@@ -63,21 +83,17 @@ def DB_INSERT(url: str, orig: Path) -> bool:
         return False
     
     try:
-        rec = DB_MAP()
-        if url in rec:
-            del rec[url]
-        
-        dest = OSS_DB / b58encode(url.encode()).decode()
-        if dest.exists():
-            shutil.rmtree(dest)
-        dest.mkdir(parents=True, exist_ok=True)
-        
-        shutil.copytree(orig, dest / orig.name, symlinks=True)
-        rec[url] = str(dest / orig.name)
-        
-        if not DB_DUMP(rec):
-            PANIC("DB_INSERT: Failed to update database")
-        
+        with repo_lock(url):
+            # Another worker may have cached this repo while we were cloning it
+            cached = DB_MAP().get(url)
+            if cached and Path(cached).exists():
+                return True
+            dest = OSS_DB / b58encode(url.encode()).decode()
+            if dest.exists():
+                shutil.rmtree(dest)
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(orig, dest / orig.name, symlinks=True)
+            _update_map(lambda rec: rec.__setitem__(url, str(dest / orig.name)))
         INFO(f"DB_INSERT: Successfully inserted {url}")
         return True
     except Exception as e:
@@ -138,12 +154,7 @@ def DB_remove(url: str, path: Path) -> bool:
             shutil.rmtree(path)
             INFO(f"DB_remove: Deleted directory {path}")
         
-        data = DB_MAP()
-        if url in data:
-            del data[url]
-            INFO(f"DB_remove: Removed {url} from database")
-        
-        return DB_DUMP(data)
+        return _update_map(lambda rec: rec.pop(url, None))
     except Exception as e:
         FAIL(f"DB_remove: Failed to remove {url}: {e}")
         return False
